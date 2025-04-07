@@ -315,6 +315,10 @@ class HFDatasetDataModule(pl.LightningDataModule):
     @staticmethod
     def collate_fn(batch, pad_token_id=0, pad_seq_len_divisible=None):
         """Default batch collator"""
+        # print("--len(batch)---", len(batch))
+        # print("---batch[0].items()----", batch[0].items())
+        # print("---len(batch[0]['input_ids'])----", len(batch[0]['input_ids']))
+        # print("---len(batch[0]['loss_mask'])----", len(batch[0]['loss_mask']))
         return {
             key: batchify(
                 torch.LongTensor(
@@ -409,6 +413,7 @@ class HFDatasetDataModule(pl.LightningDataModule):
         return {
             "tokens": torch.tensor(pack["tokens"], dtype=torch.long),
             "labels": torch.tensor(pack["labels"], dtype=torch.long),
+            "loss_mask": torch.tensor(pack["loss_mask"], dtype=torch.long),
             "input_pos": torch.tensor(pack["input_pos"], dtype=torch.long),
             "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
         }
@@ -428,6 +433,15 @@ class HFDatasetDataModule(pl.LightningDataModule):
             pack["labels"],
             (0, self.packed_sequence_size - len(pack["labels"])),
             value=CROSS_ENTROPY_IGNORE_IDX,
+        )
+
+        # Pad loss_mask
+        #TODO loss_mask is very specific to Squad. For ex: Dolly does not have loss_mask.
+        # Can it be gneralized ?
+        padded_loss_mask = F.pad(
+            pack["loss_mask"],
+                 (0, self.packed_sequence_size - len(pack["loss_mask"])),
+                 value=0,
         )
 
         # Add padding tokens as a last seq len to ensure sum is max_seq_len
@@ -451,6 +465,7 @@ class HFDatasetDataModule(pl.LightningDataModule):
         return {
             "tokens": padded_tokens,
             "labels": padded_labels,
+            "loss_mask": padded_loss_mask,
             "input_pos": padded_input_pos,
             "seq_lens": padded_seq_lens,
         }
@@ -479,6 +494,7 @@ class HFDatasetDataModule(pl.LightningDataModule):
         pack = {
             "tokens": current_pack["tokens"][:boundary],
             "labels": current_pack["labels"][:boundary],
+            "loss_mask": current_pack["loss_mask"][:boundary],
             "input_pos": current_pack["input_pos"][:boundary],
             "seq_lens": current_pack["seq_lens"][:-1] + seq_len_padding,
         }
@@ -497,6 +513,7 @@ class HFDatasetDataModule(pl.LightningDataModule):
         return {
             "tokens": current_pack["tokens"][boundary:],
             "labels": current_pack["labels"][boundary:],
+            "loss_mask": current_pack["loss_mask"][boundary:],
             "input_pos": current_pack["input_pos"][boundary:],
             "seq_lens": [next_seq_len],
         }
@@ -541,6 +558,7 @@ class HFDatasetDataModule(pl.LightningDataModule):
             current_pack = {
                 "tokens": [],
                 "labels": [],
+                "loss_mask": [],
                 "input_pos": [],
                 "seq_lens": [],
             }
@@ -548,7 +566,8 @@ class HFDatasetDataModule(pl.LightningDataModule):
             if rank == 0:
                 pbar = tqdm(total=len(ds), desc=f"Packing {split} dataset", dynamic_ncols=True)
             for sample in ds:
-                tokens, labels = sample["input_ids"], sample["labels"]
+                #print("-----sample----",sample)
+                tokens, labels, loss_mask = sample["input_ids"], sample["labels"], sample["loss_mask"]
                 # If the dataset outputs samples that are larger than the specified
                 # packed_sequence_size and we're unable to split it, user needs to modify
                 # one of the two parameters
@@ -562,6 +581,7 @@ class HFDatasetDataModule(pl.LightningDataModule):
                 # "input_pos" is the pos ids, "seq_lens" is the len of each seq within the pack
                 current_pack["tokens"] += tokens
                 current_pack["labels"] += labels
+                current_pack["loss_mask"] += loss_mask
                 current_pack["input_pos"] += [x % packed_sequence_size for x in range(seq_len)]
                 current_pack["seq_lens"] += [seq_len]
 

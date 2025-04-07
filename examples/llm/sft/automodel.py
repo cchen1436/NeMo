@@ -141,6 +141,7 @@ def main():
         '--accumulate_grad_batches', type=int, default=10, help='Number of batches to accumulate gradient over'
     )
     parser.add_argument('--max-steps', type=int, default=100, help='Maximum number of training steps')
+    parser.add_argument('--max-epochs', type=int, default=1, help='Maximum number of training epochs')
     parser.add_argument('--wandb-project', type=str, default=None, help='Wandb project to use')
     parser.add_argument('--use-torch-jit', action='store_true', help='Enables torch.compile on model')
     parser.add_argument('--enable-cpu-offload', action='store_true', help='Enabled cpu offloading; requires FSDP2')
@@ -220,6 +221,7 @@ def main():
             devices=args.devices,
             num_nodes=args.num_nodes,
             max_steps=args.max_steps,
+            max_epochs=args.max_epochs,
             accelerator='gpu',
             strategy=strategy,
             log_every_n_steps=1,
