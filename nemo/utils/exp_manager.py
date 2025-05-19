@@ -1392,7 +1392,7 @@ def configure_checkpointing(
                 f"{trainer.check_val_every_n_epoch} epochs to ensure that checkpointing"
                 " will not error out."
             )
-
+    
     checkpoint_callback = NeMoModelCheckpoint(n_resume=resume, **params)
     checkpoint_callback.last_model_path = trainer.ckpt_path or ""
     if 'mp_rank' in checkpoint_callback.last_model_path or 'tp_rank' in checkpoint_callback.last_model_path:

@@ -65,6 +65,7 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         save_last_n_optim_states: int = -1,
         **kwargs,
     ):
+
         # Parse and store "extended" parameters: save_best model and postfix.
         self.always_save_nemo = always_save_nemo
         self.save_nemo_on_train_end = save_nemo_on_train_end
