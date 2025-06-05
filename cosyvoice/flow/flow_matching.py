@@ -118,6 +118,7 @@ class ConditionalCFM(BASECFM):
             y: conditional flow
                 shape: (batch_size, n_feats, mel_timesteps)
         """
+
         b, _, t = mu.shape
 
         # random timestep
@@ -136,7 +137,7 @@ class ConditionalCFM(BASECFM):
             mu = mu * cfg_mask.view(-1, 1, 1)
             spks = spks * cfg_mask.view(-1, 1)
             cond = cond * cfg_mask.view(-1, 1, 1)
-
+      
         pred = self.estimator(y, mask, mu, t.squeeze(), spks, cond)
         loss = F.mse_loss(pred * mask, u * mask, reduction="sum") / (torch.sum(mask) * u.shape[1])
         return loss, y

@@ -48,6 +48,51 @@ from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, setu
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 import torch.distributed as dist
+from nemo.collections.speechlm2.modules.flow_inference import AudioDecoder
+import torch.nn.utils.rnn as rnn_utils
+from librosa.filters import mel as librosa_mel_fn
+
+def mel_spectrogram(y, n_fft=1024, num_mels=80, sampling_rate=22050, hop_size=256, win_size=1024, fmin=0, fmax=8000, center=False):
+    if torch.min(y) < -1.0:
+        print("min value is ", torch.min(y))
+    if torch.max(y) > 1.0:
+        print("max value is ", torch.max(y))
+
+    mel_basis = {}
+    hann_window = {} # pylint: disable=global-statement,global-variable-not-assigned
+    if f"{str(fmax)}_{str(y.device)}" not in mel_basis:
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+        mel_basis[str(fmax) + "_" + str(y.device)] = torch.from_numpy(mel).float().to(y.device)
+        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
+
+    y = torch.nn.functional.pad(
+        y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
+    )
+    y = y.squeeze(1)
+
+    spec = torch.view_as_real(
+        torch.stft(
+            y,
+            n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=hann_window[str(y.device)],
+            center=center,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
+    )
+
+    spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))
+
+    spec = torch.matmul(mel_basis[str(fmax) + "_" + str(y.device)], spec)
+
+    spec = torch.log(torch.clamp(spec, min=1e-5) * 1) # 1e-5 is clip_val
+
+    return spec
+
 
 class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
@@ -63,29 +108,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self._codebook_size = 16384
         self._num_codebooks = 1
 
-        # We load the pretrained HF LLM using "ForCausalLM" variant so that we can obtain the
-        # pretrained LM head weights.
-        # However, for S2S we need to access the activations before LM head directly
-        # to feed them to the audio codec head.
+
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
-        llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
-        self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
-        self.lm_head = llm.lm_head
-        # Note: we have to "move out" the token embedding outside of LLM to avoid
-        #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.embed_tokens
-        del self.llm.embed_tokens
+        # llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
+        # self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
+        # self.lm_head = llm.lm_head
+        # self.embed_tokens = self.llm.embed_tokens
+        # del self.llm.embed_tokens
         maybe_install_lora(self)
 
-        # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
-        setup_speech_encoder(self)
+        # setup_speech_encoder(self)
 
-        self.speech_generation = TransformerARSpeechDecoder(
-            speech_decoder_parms=OmegaConf.to_container(self.cfg.speech_decoder),
-            lantent_dim=self.llm.config.hidden_size,
-            num_audio_codebooks=self._num_codebooks,
-            num_audio_tokens_per_codebook=self.speech_vocab_size,
-        )
+        # self.speech_generation = TransformerARSpeechDecoder(
+        #     speech_decoder_parms=OmegaConf.to_container(self.cfg.speech_decoder),
+        #     lantent_dim=self.llm.config.hidden_size,
+        #     num_audio_codebooks=self._num_codebooks,
+        #     num_audio_tokens_per_codebook=self.speech_vocab_size,
+        # )
 
         self.whispervq = WhisperVQEncoder.from_pretrained(
             "THUDM/glm-4-voice-tokenizer",
@@ -97,7 +136,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             cache_dir='/hfcache',
         )
 
-        self.embed_audio_tokens = torch.nn.Embedding(16384, self.llm.config.hidden_size)
+
+        flow_config = os.path.join(self.cfg.pretrained_flow,
+                                   "config.yaml")
+        flow_checkpoint = os.path.join(
+            self.cfg.pretrained_flow,
+            'flow.pt')
+        hift_checkpoint = os.path.join(
+            self.cfg.pretrained_flow,
+            'hift.pt')
+        self.audio_decoder = AudioDecoder(config_path=flow_config, flow_ckpt_path=flow_checkpoint,
+                                     hift_ckpt_path=hift_checkpoint)
+
+        # self.embed_audio_tokens = torch.nn.Embedding(16384, self.llm.config.hidden_size)
 
 
         # cached for quicker audio decoding
@@ -113,7 +164,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     @property
     def speech_vocab_size(self):
         """Return the size of the audio codec codebook including extra speech BOS and EOS tokens."""
-        return self._codebook_size + 3
+        return self._codebook_size + 4
 
     @property
     def speech_bos_id(self) -> int:
@@ -203,57 +254,103 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return ans
 
     def prepare_inputs(self, batch: dict):
+
+
+        target_audio_list = [sample[sample != 0].unsqueeze(0) for sample in batch["target_audio"]]
+
+        target_mel_list = [mel_spectrogram(sample) for sample in target_audio_list]
+
+        speech_feat_lens = torch.tensor([x.shape[2] for x in target_mel_list], device=target_mel_list[0].device)
+
+        speech_feat = torch.nn.utils.rnn.pad_sequence(
+            [x.squeeze(0).permute(1, 0) for x in target_mel_list],
+            batch_first=True
+        ).permute(0, 2, 1)
+
+
+        with fp32_precision():
+            target_audio_list = [resample(target_audio_list[i], 22050, 16000) for i in range(len(target_audio_list))]
+
+            speech_tokens = extract_speech_token(
+            self.whispervq,
+            self.feature_extractor,
+            [(target_audio_list[i], 16000) for i in range(len(target_audio_list))],
+            )
+
+        speech_token_len = torch.tensor([len(seq) for seq in speech_tokens], dtype=torch.long, device=self.device)
+        max_len = speech_token_len.max().item()
+        padded_tensor = torch.zeros(len(speech_tokens), max_len, dtype=torch.long, device=self.device)
+        for i, seq in enumerate(speech_tokens):
+            padded_tensor[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=self.device)
+
+        speech_tokens = padded_tensor
+
+        return {
+            "speech_feat": speech_feat,
+            "speech_feat_len": speech_feat_lens,
+            "speech_token": speech_tokens,
+            "speech_token_len": speech_token_len,
+            "embedding": torch.zeros(speech_tokens.size(0), 192).to(self.device)
+        }
+
+
+
+
+
         """Prepares input tensors for the model."""
         source_encoded, source_encoded_lens = self.perception(
             input_signal=batch["source_audio"], input_signal_length=batch["source_audio_lens"]
         )
 
-        source_audio_tokens = extract_speech_token(
-            self.whispervq,
-            self.feature_extractor,
-            [(batch["source_audio"][i].unsqueeze(0), 16000) for i in range(batch["source_audio"].shape[0])],
-        )
-        source_audio_tokens = torch.tensor(source_audio_tokens, dtype=torch.long, device=self.device)
-        source_audio_embeds = self.embed_audio_tokens(source_audio_tokens)
+
+        #
+        # speech_feat = mel_spectrogram(batch["target_audio"]) # 1
+        # speech_feat_lens = (batch["target_audio_lens"] - 256) // 256 + 1  # 2
+        # 【batch, 80, n_feat】
 
         target_tokens = batch["target_tokens"]
 
-        target_codes = extract_speech_token(
-            self.whispervq,
-            self.feature_extractor,
-            [(batch["target_audio"][i].unsqueeze(0), 16000) for i in range(batch["target_audio"].shape[0])],
-        )
-        target_codes = torch.tensor(target_codes, dtype=torch.long, device=self.device).unsqueeze(dim=-1)
+        with fp32_precision():  # resample is fragile to bfloat16 default dtype
+            resampled_audio = resample(batch["target_audio"], 22050, 16000)
+
+            target_speech_tokens = extract_speech_token(
+                self.whispervq,
+                self.feature_extractor,
+                [(resampled_audio[i].unsqueeze(0), 16000) for i in range(batch["target_audio"].shape[0])],
+            )
+        # import pdb; pdb.set_trace()
+        target_speech_tokens = torch.tensor(target_speech_tokens, dtype=torch.long, device=self.device)
+        # speech_tokens = speech_tokens[:, :max(speech_tokens_lens)] # 4
 
 
 
-        min_len = min(source_encoded.shape[1], source_audio_embeds.shape[1], target_codes.shape[1], target_tokens.shape[1])
+        min_len = min(source_encoded.shape[1], target_speech_tokens.shape[1], target_tokens.shape[1])
         source_encoded = source_encoded[:, :min_len]
-        source_audio_embeds = source_audio_embeds[:, :min_len]
-        target_codes = target_codes[:, :min_len]
+        target_speech_tokens = target_speech_tokens[:, :min_len].unsqueeze(dim=-1)
         target_tokens = target_tokens[:, :min_len]
         source_encoded_lens = torch.clamp_(source_encoded_lens, max=min_len)
 
 
 
         btt = target_tokens[..., None]
-        target_codes = torch.where(btt == self.text_bos_id, self.speech_bos_id, target_codes)
-        target_codes = torch.where(btt == self.text_eos_id, self.speech_eos_id, target_codes)
 
-        target_codes = torch.cat(
+        target_speech_tokens = torch.where(btt == self.text_bos_id, self.speech_bos_id, target_speech_tokens)
+        target_speech_tokens = torch.where(btt == self.text_eos_id, self.speech_eos_id, target_speech_tokens)
+
+        target_speech_tokens = torch.cat(
             [
                 torch.full(
-                    [target_codes.shape[0], 1, target_codes.shape[-1]],
+                    [target_speech_tokens.shape[0], 1, target_speech_tokens.shape[-1]],
                     fill_value=self.speech_delay_id,
                     device=self.device,
                     dtype=torch.long,
                 ),
-                target_codes[:, :-1],
+                target_speech_tokens[:, :-1],
             ],
             dim=1,
         )
 
-        input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
+        input_ids = torch.cat([target_speech_tokens, target_tokens[..., None]], dim=-1)
 
         text_inputs = input_ids[:, :-1, -1]
         text_labels = input_ids[:, 1:, -1]
@@ -263,7 +360,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         input_embeds = self.embed_tokens(text_inputs)
 
 
-        user_stream = source_encoded[:, :-1] * self.cfg.get("duplex_user_emb_weight", 1.0) + source_audio_embeds[:, :-1] * self.cfg.get("duplex_user_token_weight", 1.0)
+        user_stream = source_encoded[:, :-1] * self.cfg.get("duplex_user_emb_weight", 1.0)
         input_embeds.add_(user_stream)
 
         loss_mask = torch.ones_like(
@@ -271,6 +368,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             device=self.device,
             dtype=torch.bool,
         )
+
 
         return {
             "input_embeds": input_embeds,
@@ -280,7 +378,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "input_audio_tokens": audio_inputs,
             "audio_labels": audio_labels,
             "loss_mask": loss_mask,
+            "speech_feat": speech_feat,
+            # for flow matching training
+            "speech_feat_len": speech_feat_lens,
+            "speech_token": speech_tokens,
+            "speech_token_len": speech_tokens_lens,
+            "embedding": torch.zeros(speech_tokens.size(0), 192).to(self.device)
         }
+
 
     def cal_acc(self, pad_outputs, pad_targets, ignore_label):
         pad_pred = pad_outputs.argmax(-1)
@@ -291,10 +396,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return (numerator / denominator).detach().item()
 
     def training_step(self, batch: dict, batch_idx: int):
-        for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
-            if is_frozen(m):
-                m.eval()
+        # for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
+        #     if is_frozen(m):
+        #         m.eval()
         inputs = self.prepare_inputs(batch)
+
+
+
+        loss = self.audio_decoder.flow(inputs, self.device)
+
+        ans = {
+            "loss": loss['loss'],
+            "learning_rate": (
+                torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
+            ),
+        }
+        self.log_dict(ans, on_step=True)
+        return ans
+        # import pdb; pdb.set_trace()
 
 
         forward_outputs = self(
@@ -343,32 +462,18 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
-        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
-        self.bleu = BLEU().reset()
+        # self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
+        # self.bleu = BLEU().reset()
 
-    def on_validation_epoch_end(self, prefix="val") -> None:
-        asr_bleu = self.asr_bleu.compute()
-        for k, m in asr_bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        bleu = self.bleu.compute()
-        for k, m in bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+    # def on_validation_epoch_end(self, prefix="val") -> None:
+        # asr_bleu = self.asr_bleu.compute()
+        # for k, m in asr_bleu.items():
+        #     self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        # bleu = self.bleu.compute()
+        # for k, m in bleu.items():
+        #     self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
 
-
-    def load_flow_decoder(self):
-        from nemo.collections.speechlm2.modules.flow_inference import AudioDecoder
-
-        flow_config = os.path.join("/lustre/fsw/portfolios/convai/users/cchen1/duplex_s2s_flow/flow_decoder",
-                                   "config.yaml")
-        flow_checkpoint = os.path.join(
-            "/lustre/fsw/portfolios/convai/users/cchen1/duplex_s2s_flow/flow_decoder",
-            'flow.pt')
-        hift_checkpoint = os.path.join(
-            "/lustre/fsw/portfolios/convai/users/cchen1/duplex_s2s_flow/flow_decoder",
-            'hift.pt')
-        self.audio_decoder = AudioDecoder(config_path=flow_config, flow_ckpt_path=flow_checkpoint,
-                                     hift_ckpt_path=hift_checkpoint)
 
 
     def validation_step(self, batch: dict, batch_idx: int):
@@ -376,44 +481,68 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if dataset_batch is None:
                 continue  # some dataset is exhausted
 
-            results = self.offline_inference(
-                dataset_batch["source_audio"],
-                dataset_batch["source_audio_lens"],
-                decode_audio=True,
-            )
+            inputs = self.prepare_inputs(dataset_batch)
 
-            with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                predicted_audio = resample(results['audio'], 22050, 16000)
-                self.asr_bleu.update(
-                    name=name,
-                    refs=dataset_batch["target_texts"],
-                    pred_audio=predicted_audio,
-                    pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
-                )
-            self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+            batch = inputs['speech_token'].shape[0]
 
 
+            this_uuid = str(uuid.uuid4())
+
+            prompt_speech_feat = torch.zeros(batch, 0, 80).to(self.device)
+            flow_prompt_speech_token = torch.zeros(batch, 0, dtype=torch.int64).to(self.device)
+            spk_emb = torch.zeros(batch, 192).to(self.device)
+
+
+            with fp32_precision(), torch.no_grad():
+
+                response_speech, _ = self.audio_decoder.token2wav(inputs['speech_token'],
+                                                                  uuid=this_uuid,
+                                                                  prompt_token=flow_prompt_speech_token.to(self.device),
+                                                                  prompt_feat=prompt_speech_feat.to(self.device),
+                                                                  embedding=spk_emb,
+                                                                  finalize=True)
             if self.cfg.get('audio_save_path') is not None and dist.get_rank() == 0:
-
-
                 os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
-
-                for i in range(len(predicted_audio)):
-                    pred_audio = predicted_audio[i]
-                    user_audio = dataset_batch["source_audio"][i]
-
-                    T1, T2 = pred_audio.shape[0], user_audio.shape[0]
-                    max_len = max(T1, T2)
-                    pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
-                    user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
-
-                    result_audio = pred_audio_padded + user_audio_padded
-
-                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{dataset_batch['sample_id'][i]}.wav",
-                                    result_audio.unsqueeze(0).float().cpu(),
-                                    16000)
-
-            dist.barrier()
+                for i in range(batch):
+                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{i}_{dataset_batch['sample_id'][i]}.wav",
+                                    response_speech[i].unsqueeze(0).cpu(), 22050)
+            # results = self.offline_inference(
+            #     dataset_batch["source_audio"],
+            #     dataset_batch["source_audio_lens"],
+            #     decode_audio=True,
+            # )
+            #
+            # with fp32_precision():  # resample is fragile to bfloat16 default dtype
+            #     predicted_audio = resample(results['audio'], 22050, 16000)
+            #     self.asr_bleu.update(
+            #         name=name,
+            #         refs=dataset_batch["target_texts"],
+            #         pred_audio=predicted_audio,
+            #         pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
+            #     )
+            # self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+            #
+            # if self.cfg.get('audio_save_path') is not None and dist.get_rank() == 0:
+            #
+            #
+            #     os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
+            #     logging.info(f"The shape of generated speech: {predicted_audio.shape}")
+            #     for i in range(len(predicted_audio)):
+            #         pred_audio = predicted_audio[i]
+            #         user_audio = dataset_batch["source_audio"][i]
+            #
+            #         T1, T2 = pred_audio.shape[0], user_audio.shape[0]
+            #         max_len = max(T1, T2)
+            #         pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
+            #         user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
+            #
+            #         result_audio = pred_audio_padded + user_audio_padded
+            #
+            #         torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{i}_{dataset_batch['sample_id'][i]}.wav",
+            #                         result_audio.unsqueeze(0).float().cpu(),
+            #                         16000)
+            #
+            # dist.barrier()
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -461,18 +590,18 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_signal_length=input_signal_lens,
         )
 
-        source_audio_tokens = extract_speech_token(
-            self.whispervq,
-            self.feature_extractor,
-            [(input_signal[i].unsqueeze(0), 16000) for i in range(input_signal.shape[0])],
-        )
+        # source_audio_tokens = extract_speech_token(
+        #     self.whispervq,
+        #     self.feature_extractor,
+        #     [(input_signal[i].unsqueeze(0), 16000) for i in range(input_signal.shape[0])],
+        # )
 
-        source_audio_tokens = torch.tensor(source_audio_tokens, dtype=torch.long, device=self.device)
-        source_audio_embeds = self.embed_audio_tokens(source_audio_tokens)
-        T_min = min(input_embeds.shape[1], source_audio_embeds.shape[1])
+        # source_audio_tokens = torch.tensor(source_audio_tokens, dtype=torch.long, device=self.device)
+        # source_audio_embeds = self.embed_audio_tokens(source_audio_tokens)
+        # T_min = min(input_embeds.shape[1], source_audio_embeds.shape[1])
 
-        input_embeds = input_embeds[:, :T_min]
-        source_audio_embeds = source_audio_embeds[:, :T_min]
+        # input_embeds = input_embeds[:, :T_min]
+        # source_audio_embeds = source_audio_embeds[:, :T_min]
 
 
         B, T_local, H = input_embeds.shape
@@ -491,7 +620,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # Apply channel weight
 
-        input_embeds = input_embeds * self.cfg.get("duplex_user_emb_weight", 1.0) + source_audio_embeds * self.cfg.get("duplex_user_token_weight", 1.0)
+        input_embeds = input_embeds * self.cfg.get("duplex_user_emb_weight", 1.0)
 
         # This cache is for self.llm
         cache = DynamicCache()
@@ -538,25 +667,35 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
 
         if decode_audio:
-            self.load_flow_decoder()
+            # self.load_flow_decoder()
             with fp32_precision(), torch.no_grad():
                 this_uuid = str(uuid.uuid4())
-                prompt_speech_feat = torch.zeros(1, 0, 80).to(self.device)
-                flow_prompt_speech_token = torch.zeros(1, 0, dtype=torch.int64).to(self.device)
 
-                first_input_token = gen_audio[:1,:,0]
-                first_input_token[first_input_token >16383] = 0
+          
+                prompt_speech_feat = torch.zeros(input_embeds.shape[0], 0, 80).to(self.device)
+                flow_prompt_speech_token = torch.zeros(input_embeds.shape[0], 0, dtype=torch.int64).to(self.device)
+                spk_emb = torch.zeros(input_embeds.shape[0], 192).to(self.device)
 
-                response_speech, _ = self.audio_decoder.token2wav(first_input_token,
+                flow_input_token = gen_audio[:,:,0]
+                flow_input_token[flow_input_token >16383] = 0
+                #
+                response_speech, _ = self.audio_decoder.token2wav(flow_input_token,
                                                                   uuid=this_uuid,
                                                                   prompt_token=flow_prompt_speech_token.to(self.device),
                                                                   prompt_feat=prompt_speech_feat.to(self.device),
+                                                                  embedding=spk_emb,
                                                                   finalize=True)
 
+                # response_speech = self.audio_decoder.stream_inference(flow_input_token,
+                #                                                   this_uuid,
+                #                                                   flow_prompt_speech_token.to(self.device),
+                #                                                   prompt_speech_feat.to(self.device),
+                #                                                   spk_emb,
+                #                                                   )
                 ans["audio"] = response_speech
-                ans["audio_len"] = torch.tensor(response_speech.shape[1]).unsqueeze(0).to(self.device)
+                ans["audio_len"] = torch.tensor(response_speech.shape[1]).unsqueeze(0).repeat(input_embeds.shape[0]).to(self.device)
 
-
+        
         return ans
 
     def backward(self, *args, **kwargs):

@@ -59,7 +59,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
     ) -> Dict[str, Optional[torch.Tensor]]:
         token = batch['speech_token'].to(device)
         token_len = batch['speech_token_len'].to(device)
-        feat = batch['speech_feat'].to(device)
+        feat = batch['speech_feat'].to(device).transpose(1, 2) # add by cc
         feat_len = batch['speech_feat_len'].to(device)
         embedding = batch['embedding'].to(device)
 
@@ -71,6 +71,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
         # concat text and prompt_text
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
         # print(token.max(),self.input_embedding)
+
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
 
@@ -90,6 +91,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
 
         mask = (~make_pad_mask(feat_len)).to(h)
         feat = F.interpolate(feat.unsqueeze(dim=1), size=h.shape[1:], mode="nearest").squeeze(dim=1)
+
         loss, _ = self.decoder.compute_loss(
             feat.transpose(1, 2).contiguous(),
             mask.unsqueeze(1),
@@ -108,15 +110,17 @@ class MaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat,
                   prompt_feat_len,
                   embedding):
-        assert token.shape[0] == 1
+        # assert token.shape[0] == 1
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
+
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
 
         # text encode
         h, h_lengths = self.encoder(token, token_len)
@@ -124,14 +128,17 @@ class MaskedDiffWithXvec(torch.nn.Module):
         feat_len = (token_len / self.input_frame_rate * 22050 / 256).int()
         h, h_lengths = self.length_regulator(h, feat_len)
 
+
+
         # get conditions
-        conds = torch.zeros([1, feat_len.max().item(), self.output_size], device=token.device)
+        conds = torch.zeros([token.shape[0], feat_len.max().item(), self.output_size], device=token.device)
         if prompt_feat.shape[1] != 0:
             for i, j in enumerate(prompt_feat_len):
                 conds[i, :j] = prompt_feat[i]
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(feat_len)).to(h)
+
         feat = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),

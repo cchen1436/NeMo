@@ -101,17 +101,49 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
+
+
+
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         target_audio, target_audio_lens = collate_audio(
             cuts.resample(self.target_sample_rate), recording_field="target_audio"
         )
-        target_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles
-        )
-        source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles
-        )
+
+
+
+        if len(cuts[0].supervisions) > 0:
+            
+            sample_id = [" ".join(s.id for s in cut.supervisions if s.speaker in ["user"]) for cut in cuts]
+            target_tokens, target_token_lens = collate_token_channel(
+                cuts, self.tokenizer, self.frame_length, roles=self.output_roles
+            )
+            source_tokens, source_token_lens = collate_token_channel(
+                cuts, self.tokenizer, self.frame_length, roles=self.input_roles
+            )
+            target_texts = [
+                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+            ]
+
+        else:
+
+            sample_id = [cut.id for cut in cuts]
+            (
+                target_tokens,
+                target_token_lens,
+            ) = collate_token_channel_new_data(  # Changed to the new function
+                cuts, self.tokenizer, self.frame_length, roles=self.output_roles, segment_type="agent_segments"
+            )
+            (
+                source_tokens,
+                source_token_lens,
+            ) = collate_token_channel_new_data(  # Changed to the new function
+                cuts, self.tokenizer, self.frame_length, roles=self.input_roles, segment_type="user_segments"
+            )
+            target_texts = [" ".join(segment["text"] for segment in cut.custom["agent_segments"]) for cut in cuts]
+
+
         return {
+            "sample_id": sample_id,
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
             "target_audio": target_audio,
@@ -120,9 +152,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_token_lens": target_token_lens,
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
-            "target_texts": [
-                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
-            ],
+            "target_texts": target_texts
         }
 
 
@@ -190,6 +220,76 @@ def build_token_channel(
     return tokens
 
 
+def collate_token_channel_new_data(
+    cuts: CutSet,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    roles: set[str],
+    segment_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Collate token channel for the new data format."""
+    pad_id = get_pad_id(tokenizer)
+    tokens = [
+        build_token_channel_new_data(
+            c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, segment_type=segment_type
+        )
+        for c in cuts
+    ]
+    token_lens = torch.tensor([len(tt) for tt in tokens])
+    tokens = collate_vectors(tokens, padding_value=pad_id)
+    return tokens, token_lens
+
+
+def build_token_channel_new_data(
+    cut: Cut,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    roles: set[str],
+    pad_id: int,
+    segment_type: str,
+) -> torch.Tensor:
+    """Build token channel for the new data format."""
+    diagnostic = f"Extra info: {cut.id=}"
+    if getattr(cut, "shard_origin", None) is not None:
+        diagnostic = f"{diagnostic} {cut.shard_origin=}"
+
+    total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
+    tokens = torch.ones(total, dtype=torch.long) * pad_id
+
+    segments = cut.custom.get(segment_type, [])  # Get the correct segment type
+
+    for segment in segments:
+        # 移除speaker判断，直接使用segment_type
+        text = segment["text"]
+        text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(text))
+
+        # Determine the frame offset for the start of the segment
+        pos = compute_num_frames(segment["start"], frame_length, cut.sampling_rate)
+        if pos > len(tokens):
+            logging.warning(
+                f"Ill-constructed example: the beginning offset of a segment {pos} is larger than the example's length {len(tokens)}. {diagnostic}"
+            )
+            continue
+
+        # Determine the frame offset for the last non-EOS text token
+        endpos = pos + len(text_ids)
+        if endpos > len(tokens):
+            trunc_len = len(tokens) - pos
+            logging.warning(
+                f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
+            )
+            text_ids = text_ids[:trunc_len]
+        try:
+            tokens[pos:endpos] = text_ids
+        except Exception as e:
+            raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
+
+        # Insert EOS at the end of the segment
+        eospos = compute_num_frames(segment["end"], frame_length, cut.sampling_rate)
+        if eospos < len(tokens):  # skip otherwise - unfinished turn
+            tokens[eospos] = tokenizer.eos
+
+    return tokens
 def _strip_timestamps(
     text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
 ) -> str:
