@@ -13,8 +13,10 @@
 # limitations under the License.
 from .asr_bleu import ASRBLEU
 from .bleu import BLEU
+from .mos import MOS
 
 __all__ = [
     'ASRBLEU',
     'BLEU',
+    "MOS",
 ]

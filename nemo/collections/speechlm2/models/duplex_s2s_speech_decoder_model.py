@@ -40,6 +40,7 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.mos import MOS
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.modules.speech_tokenizer.utils import extract_speech_token
@@ -462,18 +463,21 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
-        # self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
+        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         # self.bleu = BLEU().reset()
+        self.mos = MOS().reset()
 
-    # def on_validation_epoch_end(self, prefix="val") -> None:
-        # asr_bleu = self.asr_bleu.compute()
-        # for k, m in asr_bleu.items():
-        #     self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+    def on_validation_epoch_end(self, prefix="val") -> None:
+        asr_bleu = self.asr_bleu.compute()
+        for k, m in asr_bleu.items():
+            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         # bleu = self.bleu.compute()
         # for k, m in bleu.items():
         #     self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
-
+        mos = self.mos.compute()
+        for k, m in mos.items():
+            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
 
     def validation_step(self, batch: dict, batch_idx: int):
@@ -501,11 +505,30 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                                                                   prompt_feat=prompt_speech_feat.to(self.device),
                                                                   embedding=spk_emb,
                                                                   finalize=True)
-            if self.cfg.get('audio_save_path') is not None and dist.get_rank() == 0:
+
+
+
                 os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
                 for i in range(batch):
                     torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{i}_{dataset_batch['sample_id'][i]}.wav",
                                     response_speech[i].unsqueeze(0).cpu(), 22050)
+
+                pred_audios = resample(response_speech, 22050, 16000)
+
+                self.asr_bleu.update(
+                    name=name,
+                    refs=dataset_batch["target_texts"],
+                    pred_audio=pred_audios,
+                    pred_audio_lens=(pred_audios.shape[1] / 22050 * 16000).to(torch.long),
+                )
+
+                self.mos.update(
+                    name=name,
+                    pred_audios=pred_audios,
+                    tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
+                )
+
+
             # results = self.offline_inference(
             #     dataset_batch["source_audio"],
             #     dataset_batch["source_audio_lens"],
