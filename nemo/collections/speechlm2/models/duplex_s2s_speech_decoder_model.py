@@ -40,6 +40,7 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.mos import MOS
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.modules.speech_tokenizer.utils import extract_speech_token
@@ -383,38 +384,47 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 decode_audio=True,
             )
 
-            with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                predicted_audio = resample(results['audio'], 22050, 16000)
-                self.asr_bleu.update(
-                    name=name,
-                    refs=dataset_batch["target_texts"],
-                    pred_audio=predicted_audio,
-                    pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
-                )
+
+
+            with fp32_precision():
+                pred_audios = resample(results["audio"], 22050, 16000)
+
+
+            if self.cfg.get('audio_save_path') is not None:
+                self.save_predicted_audio(pred_audios, dataset_batch, name)
+
+            self.mos.update(
+                name=name,
+                pred_audios=pred_audios,
+                tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
+            )
+
+            self.asr_bleu.update(
+                name=name,
+                refs=dataset_batch["target_texts"],
+                pred_audio=pred_audios,
+                pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
+            )
+
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
 
-            if self.cfg.get('audio_save_path') is not None and dist.get_rank() == 0:
+    def save_predicted_audio(self, pred_audios, dataset_batch, name):
 
-
-                os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
-                logging.info(f"The shape of generated speech: {predicted_audio.shape}")
-                for i in range(len(predicted_audio)):
-                    pred_audio = predicted_audio[i]
-                    user_audio = dataset_batch["source_audio"][i]
-
-                    T1, T2 = pred_audio.shape[0], user_audio.shape[0]
-                    max_len = max(T1, T2)
-                    pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
-                    user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
-
-                    result_audio = pred_audio_padded + user_audio_padded
-
-                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{i}_{dataset_batch['sample_id'][i]}.wav",
-                                    result_audio.unsqueeze(0).float().cpu(),
-                                    16000)
-
-            dist.barrier()
-
+        save_path = os.path.join(self.cfg.get('audio_save_path'), name)
+        os.makedirs(save_path, exist_ok=True)
+        for i in range(len(pred_audios)):
+            pred_audio = pred_audios[i]
+            user_audio =  dataset_batch["source_audio"][i]
+            T1, T2 = pred_audio.shape[0], user_audio.shape[0]
+            max_len = max(T1, T2)
+            pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
+            user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
+            result_audio = pred_audio_padded + user_audio_padded
+            if len(dataset_batch['sample_id'][0]) == 0:
+                dataset_batch['sample_id'][0] = dataset_batch['target_texts'][0][:6]
+            torchaudio.save(f"{self.cfg.audio_save_path}/{name}/{dataset_batch['sample_id'][i]}.wav",
+                            result_audio.unsqueeze(0).float().cpu(),
+                            16000)
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
 
