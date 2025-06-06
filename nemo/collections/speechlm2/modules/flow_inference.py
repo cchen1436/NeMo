@@ -49,13 +49,13 @@ class AudioDecoder:
                   prompt_feat=torch.zeros(1, 0, 80), embedding=torch.zeros(1, 192), finalize=False):
 
         tts_mel = self.flow.inference(token=token.to(self.device),
-                                      token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                      token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device).repeat(token.shape[0]),
                                       prompt_token=prompt_token.to(self.device),
                                       prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(
-                                          self.device),
+                                          self.device).repeat(token.shape[0]),
                                       prompt_feat=prompt_feat.to(self.device),
                                       prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(
-                                          self.device),
+                                          self.device).repeat(token.shape[0]),
                                       embedding=embedding.to(self.device))
 
         # mel overlap fade in out
@@ -95,14 +95,13 @@ class AudioDecoder:
         tts_speech, tts_mel = self.token2wav(token, uuid=this_uuid, finalize=True)
         return tts_speech.cpu()
 
-    def stream_inference(self, token):
-        token.to(self.device)
-        this_uuid = str(uuid.uuid1())
+    def stream_inference(self, token, this_uuid, flow_prompt_speech_token, prompt_speech_feat, spk_emb):
+
 
         # Prepare other necessary input tensors
-        llm_embedding = torch.zeros(1, 192).to(self.device)
-        prompt_speech_feat = torch.zeros(1, 0, 80).to(self.device)
-        flow_prompt_speech_token = torch.zeros(1, 0, dtype=torch.int32).to(self.device)
+        # llm_embedding = torch.zeros(1, 192).to(self.device)
+        # prompt_speech_feat = torch.zeros(1, 0, 80).to(self.device)
+        # flow_prompt_speech_token = torch.zeros(1, 0, dtype=torch.int32).to(self.device)
 
         tts_speechs = []
         tts_mels = []
@@ -114,7 +113,7 @@ class AudioDecoder:
             # if idx>block_size: break
             tts_token = token[:, idx:idx + block_size]
 
-            print(tts_token.size())
+            # print(tts_token.size())
 
             if prev_mel is not None:
                 prompt_speech_feat = torch.cat(tts_mels, dim=-1).transpose(1, 2)
@@ -125,18 +124,22 @@ class AudioDecoder:
             else:
                 is_finalize = False
 
+
+
             tts_speech, tts_mel = self.token2wav(tts_token, uuid=this_uuid,
                                                  prompt_token=flow_prompt_speech_token.to(self.device),
-                                                 prompt_feat=prompt_speech_feat.to(self.device), finalize=is_finalize)
+                                                 prompt_feat=prompt_speech_feat.to(self.device),
+                                                 embedding=spk_emb,
+                                                 finalize=is_finalize)
 
             prev_mel = tts_mel
             prev_speech = tts_speech
-            print(tts_mel.size())
+            # print(tts_mel.size())
 
             tts_speechs.append(tts_speech)
             tts_mels.append(tts_mel)
 
         # Convert Mel spectrogram to audio using HiFi-GAN
-        tts_speech = torch.cat(tts_speechs, dim=-1).cpu()
+        tts_speech = torch.cat(tts_speechs, dim=-1)
 
-        return tts_speech.cpu()
+        return tts_speech
