@@ -519,7 +519,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     name=name,
                     refs=dataset_batch["target_texts"],
                     pred_audio=pred_audios,
-                    pred_audio_lens=(pred_audios.shape[1] / 22050 * 16000).to(torch.long),
+                    pred_audio_lens=torch.tensor(pred_audios.shape[1] / 22050 * 16000).repeat(batch).to(torch.long),
                 )
 
                 self.mos.update(
