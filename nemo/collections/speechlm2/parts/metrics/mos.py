@@ -38,14 +38,24 @@ class MOS:
         return self
 
     def update(self, name, pred_audios, tmp_dir) -> None:
-        os.makedirs(tmp_dir, exist_ok=True)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        rank_tmp_dir = os.path.join(tmp_dir, f"rank_{local_rank}")
+        os.makedirs(rank_tmp_dir, exist_ok=True)
+
+
         for i, waveform in enumerate(pred_audios):
-            torchaudio.save(f"{tmp_dir}/sample_{i}.wav", waveform.unsqueeze(0).cpu(), 16000)
+
+            waveform = waveform.detach().cpu()
+            torchaudio.save(f"{rank_tmp_dir}/sample_{i}.wav", waveform.unsqueeze(0), 16000)
             if i > 1:
                 break
-        all_mos = self.model.predict(input_dir=tmp_dir)
 
-        mos_score = sum([item['predicted_mos'] for item in all_mos])/len(all_mos)
+        torch.distributed.barrier()
+
+        all_mos = self.model.predict(input_dir=rank_tmp_dir)
+
+        mos_score = sum([item['predicted_mos'] for item in all_mos]) / len(all_mos)
         self._score[name].append(mos_score)
 
     def compute(self) -> dict[str, torch.Tensor]:
@@ -53,7 +63,7 @@ class MOS:
 
         for name in self._score.keys():
             metric = torch.tensor(self._score[name])
-            corpus_metric[f"mos_{name}"] = metric
+            corpus_metric[f"mos_{name}"] = metric.mean()
 
         corpus_metric['mos'] = torch.stack(list(corpus_metric.values())).mean()
         self._score.clear()

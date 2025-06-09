@@ -346,6 +346,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.on_train_epoch_start()
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
+        self.mos = MOS().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
@@ -353,6 +354,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         bleu = self.bleu.compute()
         for k, m in bleu.items():
+            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        mos = self.mos.compute()
+        for k, m in mos.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
 
