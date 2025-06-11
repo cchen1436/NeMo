@@ -121,6 +121,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_token_lens": target_token_lens,
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
+            "source_texts": [
+                " ".join(s.text for s in cut.supervisions if s.speaker in self.input_roles) for cut in cuts
+            ],
             "target_texts": [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ],
