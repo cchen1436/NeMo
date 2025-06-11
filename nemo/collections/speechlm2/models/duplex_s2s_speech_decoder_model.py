@@ -28,7 +28,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from transformers import DynamicCache
-
+from collections import defaultdict
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
@@ -333,7 +333,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
         self.mos = MOS().reset()
-        import defaultdict
         self.val_results_to_save = defaultdict(list)
 
     def on_validation_epoch_end(self, prefix="val") -> None:
