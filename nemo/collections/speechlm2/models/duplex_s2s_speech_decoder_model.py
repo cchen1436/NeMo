@@ -28,7 +28,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from transformers import DynamicCache
-
+from collections import defaultdict
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
@@ -85,13 +85,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             num_audio_tokens_per_codebook=self.speech_vocab_size,
         )
 
-        self.embed_audio_tokens = torch.nn.ModuleList(
-            [
-                torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
-                for _ in range(self._num_codebooks)
-            ]
-        )
-        self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
+        # self.embed_audio_tokens = torch.nn.ModuleList(
+        #     [
+        #         torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
+        #         for _ in range(self._num_codebooks)
+        #     ]
+        # )
+        # self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
 
         # cached for quicker audio decoding
         self.register_buffer(
@@ -333,6 +333,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
         self.mos = MOS().reset()
+        self.val_results_to_save = defaultdict(list)
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
@@ -345,6 +346,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for k, m in mos.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
+
+        for name, results in self.val_results_to_save.items():
+            save_dir = os.path.join(self.cfg.audio_save_path, name)
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "results.json")
+            with open(save_path, "w") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+
     def validation_step(self, batch: dict, batch_idx: int):
         for name, dataset_batch in batch.items():
 
@@ -356,6 +365,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 dataset_batch["source_audio_lens"],
             )
 
+
+            for user, pred in zip(dataset_batch["source_texts"], results["text"] ):
+                self.val_results_to_save[name].append({
+                    "user_text": user,
+                    "pred_text": pred
+                })
 
             with fp32_precision():
                 pred_audios = resample(results["audio"], 22050, 16000)
@@ -619,3 +634,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.lm_head = fully_shard(self.lm_head, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
             self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
+
+
+
