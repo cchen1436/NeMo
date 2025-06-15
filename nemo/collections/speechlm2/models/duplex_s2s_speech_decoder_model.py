@@ -333,7 +333,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
 
         silence_start, silence_end = self.extract_silence_segments(audio_signal)
-        import pdb; pdb.set_trace()
+    
 
         batch_size, signal_length = audio_signal.shape
 
