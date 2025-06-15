@@ -1,0 +1,20 @@
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+
+  | Name               | Type                       | Params | Mode 
+--------------------------------------------------------------------------
+0 | audio_codec        | AudioCodecModel            | 62.2 M | eval 
+1 | llm                | LlamaModel                 | 968 M  | train
+2 | lm_head            | Linear                     | 65.5 M | train
+3 | embed_tokens       | Embedding                  | 65.5 M | train
+4 | perception         | AudioPerceptionModule      | 122 M  | train
+5 | speech_generation  | TransformerARSpeechDecoder | 292 M  | train
+6 | embed_audio_tokens | ModuleList                 | 54.5 M | train
+7 | audio_head         | Linear                     | 54.6 M | train
+--------------------------------------------------------------------------
+1.6 B     Trainable params
+87.5 M    Non-trainable params
+1.7 B     Total params
+6,746.895 Total estimated model params size (MB)
+1065      Modules in train mode
+2018      Modules in eval mode
+SLURM auto-requeueing enabled. Setting signal handlers.

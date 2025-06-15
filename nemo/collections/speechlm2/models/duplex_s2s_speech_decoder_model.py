@@ -32,6 +32,7 @@ from torch.distributed.tensor.parallel import (
 )
 import tempfile
 from transformers import DynamicCache
+import numpy as np
 
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
@@ -42,6 +43,7 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.behavior import BEHAVIOR
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -286,6 +288,117 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             ans["cache"] = out["past_key_values"]
         return ans
 
+    def extract_silence_segments(self, audio_tensor, sample_rate=16000, min_duration=1.0):
+
+        batch_size = audio_tensor.size(0)
+        min_samples = int(min_duration * sample_rate)
+
+        audio_np = audio_tensor.cpu().numpy()
+
+        silence_start = []
+        silence_end = []
+
+        for i in range(batch_size):
+            is_silence = (audio_np[i] == 0)
+            diff = np.diff(is_silence.astype(int))
+            starts = np.where(diff == 1)[0] + 1
+            ends = np.where(diff == -1)[0] + 1
+
+            if is_silence[0]:
+                starts = np.insert(starts, 0, 0)
+            if is_silence[-1]:
+                ends = np.append(ends, len(is_silence))
+
+
+            valid_segments = []
+            for s, e in zip(starts, ends):
+                if (e - s) >= min_samples:
+                    valid_segments.append((s, e))
+
+
+            starts_sec = [s / sample_rate for s, _ in valid_segments]
+            ends_sec = [e / sample_rate for _, e in valid_segments]
+
+            silence_start.append(starts_sec)
+            silence_end.append(ends_sec)
+
+        return silence_start, silence_end
+
+    def add_backchannel_in_silence(self, audio_batch, short_audio_folder, insert_prob=1.0, scaling_range=(0.5, 1.0),
+                                   is_inference=False):
+
+        sr_target = 16000
+        sr_short = 24000
+        audio_signal = audio_batch['source_audio']  # [batch, length]
+
+
+        silence_start, silence_end = self.extract_silence_segments(audio_signal)
+        import pdb; pdb.set_trace()
+
+        batch_size, signal_length = audio_signal.shape
+
+        short_files = [f for f in os.listdir(short_audio_folder) if f.endswith('.wav')]
+        if not short_files:
+            raise ValueError(f"No short audio files found in {short_audio_folder}")
+        backchannel_end_times = []
+
+        for i in range(batch_size):
+            seg_starts = silence_start[i] if isinstance(silence_start[i], list) else silence_start[
+                i].cpu().numpy().tolist()
+            seg_ends = silence_end[i] if isinstance(silence_end[i], list) else silence_end[i].cpu().numpy().tolist()
+            sample_end_times = []
+            for seg_start, seg_end in zip(seg_starts, seg_ends):
+                silence_duration = seg_end - seg_start  # 单位：秒
+                if silence_duration < 4:
+                    sample_end_times.append(0)
+                    continue
+                if random.random() > insert_prob:
+                    sample_end_times.append(0)
+                    continue
+                short_path = os.path.join(short_audio_folder, random.choice(short_files))
+                waveform, file_sr = torchaudio.load(short_path)  # waveform: [channels, samples]
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                waveform = waveform.squeeze(0)  # shape: [samples]
+                if file_sr != sr_short:
+                    waveform = torchaudio.functional.resample(waveform, orig_freq=file_sr, new_freq=sr_short)
+                short_audio_resampled = torchaudio.functional.resample(waveform, orig_freq=sr_short, new_freq=sr_target)
+                short_duration = short_audio_resampled.shape[0] / sr_target  # 单位：秒
+                if short_duration > (silence_duration - 4):
+                    sample_end_times.append(0)
+                    continue
+                if is_inference:
+                    insertion_window_start = seg_start + 1.5
+                    insertion_window_end = seg_start + 3
+                    max_allowed = seg_end - 2 - short_duration
+                    insertion_window_end = min(insertion_window_end, max_allowed)
+                else:
+                    insertion_window_start = seg_start + 2
+                    insertion_window_end = seg_end - 2 - short_duration
+
+                if insertion_window_end < insertion_window_start:
+                    sample_end_times.append(0)
+                    continue
+                insertion_offset = random.uniform(insertion_window_start, insertion_window_end)
+                insertion_idx = int(insertion_offset * sr_target)
+                insertion_end_idx = insertion_idx + short_audio_resampled.shape[0]
+                if insertion_end_idx > signal_length:
+                    sample_end_times.append(0)
+                    continue
+                short_audio_tensor = short_audio_resampled.to(device=audio_signal.device, dtype=audio_signal.dtype)
+                scale = random.uniform(scaling_range[0], scaling_range[1])
+                short_audio_tensor = short_audio_tensor * scale
+                audio_signal[i, insertion_idx:insertion_end_idx] = short_audio_tensor
+                end_time = insertion_end_idx / sr_target
+                sample_end_times.append(end_time)
+
+            if len(sample_end_times) < len(seg_starts):
+                sample_end_times.extend([0] * (len(seg_starts) - len(sample_end_times)))
+            backchannel_end_times.append(sample_end_times)
+        audio_batch['source_audio'] = audio_signal
+        if is_inference:
+            return backchannel_end_times
+
     def prepare_inputs(self, batch: dict):
         """
         Similar to DuplexS2SModel.prepare_inputs, with following changes:
@@ -296,6 +409,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         assert batch["source_audio"].size(0) == batch["target_audio"].size(0)
         assert batch["target_first_turn_audio"].size(0) == batch["target_audio"].size(0)
 
+
+        if self.cfg.get('backchannel_prob_user', 0.0) > 0:
+            self.add_backchannel_in_silence(audio_batch=batch, short_audio_folder='/lustre/fsw/portfolios/llmservice/users/cchen1/data/bc_wavs', insert_prob=self.cfg.backchannel_prob_user)
 
         # change audio volume randomly
         if self.training and random.random() < self.cfg.get('noise_prob_scale_user', 0.0):
@@ -470,7 +586,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 """
                 if tensor.ndim != 1:
                     raise ValueError("Input tensor must be 1D.")
-
                 count = 0
                 for token in tensor:
                     if token.item() == silence_token:
@@ -580,11 +695,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # update tracker state
             self._param_tracker_state[name] = now.clone().detach()
 
+
+
+
+
     def training_step(self, batch: dict, batch_idx: int):
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
             if is_frozen(m):
                 m.eval()
-        
+
         # self.track_param_updates("speech_generation.")
 
         inputs = self.prepare_inputs(batch)
@@ -656,6 +775,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
+        self.behavior = BEHAVIOR().reset()
+
+
         tolerance = int(160/(1000/self.target_fps)) # 160 ms as tolerance --> 2 tokens for 12.5FPS and 1 for 50FPS
         self.text_bos_acc = TokenAccuracy(token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance).reset()
         self.text_eos_acc = TokenAccuracy(token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance).reset()
@@ -674,6 +796,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
+
+        behavior = self.behavior.compute()
+        for k, m in behavior.items():
+            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+
+
     def validation_step(self, batch: dict, batch_idx: int):
 
         # Update speaker embedding to reflect the one in the prompt during inference
@@ -683,6 +811,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for name, dataset_batch in batch.items():
             if dataset_batch is None:
                 continue  # some dataset is exhausted
+
 
             results = self.offline_inference(
                 dataset_batch["source_audio"],
@@ -709,9 +838,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     user_audio_sr=self.source_sample_rate,
                 )
 
+
+            self.behavior.update(name=name, pred_audio=resample(results["audio"], 22050, 16000), user_audio=dataset_batch["source_audio"])
+            #self.behavior.update(name=name, pred_audio=resample(dataset_batch["target_audio"], 22050, 16000),
+            #                     user_audio=dataset_batch["source_audio"])
+
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()

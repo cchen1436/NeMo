@@ -1,0 +1,277 @@
+model:
+  pretrained_llm: TinyLlama/TinyLlama_v1.1
+  pretrained_audio_codec: /lustre/fsw/portfolios/convai/users/ecasanova/Checkpoints/Low_Frame-rate_Speech_Codec++_nemo_last_checkpoint/ml-model-NanoCodec-13_codebooks_2016_codes_1.78kbps_12.5FPS_aug_grad_clip_skip_nan/checkpoints/Low_Frame-rate_Speech_Codec++.nemo
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/cchen1/code/duplex_s2s/stt_en_fastconformer_hybrid_large_streaming_80ms.nemo
+  scoring_asr: stt_en_fastconformer_transducer_large
+  pretrained_weights: true
+  audio_loss_weight: 13
+  text_loss_weight: 3
+  freeze_params:
+  - ^audio_codec\..+$
+  - ^speech_generation\.speaker_encoder\..+$
+  prevent_freeze_params: []
+  duplex_user_channel_weight: 1.0
+  hidden_pooling_factor: 2
+  audio_save_path: /lustre/fsw/portfolios/llmservice/users/cchen1/code/edr/NeMo-rebased-main/results/pred_audios
+  perception:
+    target: nemo.collections.multimodal.speech_llm.modules.perception_modules.AudioPerceptionModule
+    use_multi_layer_feat: false
+    add_sep: true
+    is_canary: true
+    preprocessor:
+      normalize: NA
+    encoder:
+      self_attention_model: rel_pos
+      att_context_size:
+      - 70
+      - 1
+      conv_context_size: causal
+      conv_norm_type: layer_norm
+    modality_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 512
+      feat_out: -1
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 1
+      subsampling_conv_channels: 256
+      causal_downsampling: true
+      ff_expansion_factor: 4
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size:
+      - 70
+      - 1
+      att_context_style: chunked_limited
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 9
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0
+      dropout_pre_encoder: 0
+      dropout_emb: 0.0
+      dropout_att: 0
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2
+      time_masks: 20
+      freq_width: 27
+      time_width: 5
+  speech_decoder:
+    n_layers: 12
+    d_model: 768
+    d_ffn: 3072
+    sa_n_heads: 12
+    kernel_size: 3
+    p_dropout: 0.1
+    p_dropout_out: 0.0
+    has_xattn: false
+    xa_d_memory: 768
+    xa_n_heads: 12
+    is_causal: true
+    apply_norm_to_cond: true
+    apply_norm_out: true
+    max_length_causal_mask: 5000
+    cond_on_prev_audio_tokens: true
+    detach_input: false
+    use_learnable_pos_emb: true
+    cond_on_modality_adapter_emb: false
+    cond_on_char_embedding: true
+    cond_on_llm_latent: true
+    use_speaker_encoder: true
+    inference_speaker_reference: /lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/inference_references/Emma_S3_A1_SC7_singleturntarget_21_channel_1_audio_in.wav
+    cond_on_asr_emb: false
+    cond_on_text_tokens: false
+    cfg_scale: 2.5
+    cfg_unconditional_prob: 0.2
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.0003
+    betas:
+    - 0.9
+    - 0.98
+    weight_decay: 0
+    foreach: true
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    warmup_steps: 2500
+    min_lr: 1.0e-06
+    max_steps: 100000
+  pretrained_tts_from_s2s: /lustre/fsw/portfolios/convai/users/ecasanova/Checkpoints/Koel-TTS/tts_pretrained_checkpoint_old_codebase_fp32_aug_codec_25395steps.ckpt
+  mask_sequence_loss: true
+  custom_codebook_size: 2045
+  custom_speech_bos_id: 2019
+  custom_speech_eos_id: 2020
+  custom_speech_delay_id: 2018
+  scale_loss_by: non_sil_t
+  advance_text_channel_by: 4
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 100000
+  val_check_interval: 900
+  limit_train_batches: 900
+  limit_val_batches: 1
+  log_every_n_steps: 20
+  num_sanity_val_steps: 0
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+data:
+  frame_length: 0.08
+  source_sample_rate: 16000
+  target_sample_rate: 22050
+  input_roles:
+  - user
+  - User
+  output_roles:
+  - agent
+  - Assistant
+  - assistant
+  train_ds:
+    sample_rate: 22050
+    multi_config: true
+    shuffle: true
+    sampler_fusion: randomized_round_robin
+    sampler_weights:
+      real_conv_data: 0.0005
+      ttsrepeat: 0.0005
+      synthetic: 0.999
+    synthetic:
+      input_cfg: /lustre/fsw/portfolios/convai/users/ecasanova/S2S-Duplex-new-codebase/scripts/configs/data/all_synthetic_data.yaml
+      buffer_size: 1000
+      shuffle_buffer_size: 1000
+      num_workers: 1
+      pin_memory: true
+      max_duration: 142.39029
+      batch_duration: 250
+      quadratic_duration: 20
+      num_buckets: 31
+      duration_bins:
+      - 1
+      - 6
+      - 11
+      - 16
+      - 21
+      - 26
+      - 31
+      - 36
+      - 41
+      - 46
+      - 51
+      - 56
+      - 61
+      - 66
+      - 71
+      - 76
+      - 81
+      - 86
+      - 91
+      - 96
+      - 101
+      - 106
+      - 111
+      - 116
+      - 121
+      - 126
+      - 131
+      - 136
+      - 141
+      - 146
+      use_bucketing: true
+      seed: trng
+      noise_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex_noise_augmentations/dns5_lhotse_shars_16khz/dns5_noise_cuts.jsonl.gz
+      noise_mix_prob: 0.99
+      noise_snr:
+      - 0
+      - 50
+      rir_enabled: true
+      rir_path: /lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex_noise_augmentations/rir_noise_SLR28_simulated_shar/rir_noise_SLR28.jsonl.gz
+      rir_prob: 0.99
+    seed: 42
+    shard_seed: trng
+    num_workers: 1
+    batch_duration: 400
+    max_duration: 142.39029
+    bucket_duration_bins:
+    - 1
+    - 6
+    - 11
+    - 16
+    - 21
+    - 26
+    - 31
+    - 36
+    - 41
+    - 46
+    - 51
+    - 56
+    - 61
+    - 66
+    - 71
+    - 76
+    - 81
+    - 86
+    - 91
+    - 96
+    - 101
+    - 106
+    - 111
+    - 116
+    - 121
+    - 126
+    - 131
+    - 136
+    - 141
+    - 146
+    use_bucketing: true
+    bucket_buffer_size: 1000
+  validation_ds:
+    datasets:
+      daring:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/340b_8.19_daring_anteater_lmsys_sft_8801rm3.7p_test/
+      ultrachat:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex/ultrachat_v2/shar_duplex/manifest_000200
+      topic:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex/topic_v2/Meta-Llama-3.1-70B-Instruct/shar_duplex/manifest_000050
+      demo:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/shar
+    sample_rate: 22050
+    batch_size: 8
+    seed: 42
+    shard_seed: randomized
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: /lustre/fsw/portfolios/llmservice/users/cchen1/code/edr/NeMo-rebased-main/results
+  name: duplex_s2s_decoder_v2_all_synthetic_data_char_emb_llm_latent_modality_adptor_emb
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: 00:03:50:00
+  resume_from_checkpoint: null
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: development-run
+    project: salm_s2s_speech_decoder_v2_char_tokens
+    resume: true
+  checkpoint_callback_params:
+    filename: '{step}'
+    monitor: val_asr_bleu
+    mode: max
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 1
+    always_save_nemo: false
