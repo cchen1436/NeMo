@@ -362,7 +362,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if dataset_batch is None:
                 continue  # some dataset is exhausted
 
-            # inputs = self.prepare_inputs(batch)
+            # inputs = self.prepare_inputs(dataset_batch)
             # with torch.no_grad():
             #     forward_outputs = self(
             #         inputs["input_embeds"],
@@ -390,6 +390,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             #                               inputs["text_labels"].flatten(0, 1), 0)
             # audio_acc = self.cal_token_acc(forward_outputs["audio_logits"].flatten(0, 1),
             #                                inputs["audio_labels"].flatten(0, 1), -1)
+            # self.log()
 
             results = self.offline_inference(
                 dataset_batch["source_audio"],
