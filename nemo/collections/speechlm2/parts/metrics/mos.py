@@ -51,7 +51,7 @@ class MOS:
             if i > 1:
                 break
 
-       # torch.distributed.barrier()
+        torch.distributed.barrier()
 
         all_mos = self.model.predict(input_dir=rank_tmp_dir)
 
